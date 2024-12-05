@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: pages/api/orders.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: pages/api/orders.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @fileoverview API endpoint for processing new orders and managing inventory
+ * @author Alex Borgfeld
+ */
+
+import { pool } from '@/lib/db';
+
+/**
+ * Updates inventory quantities for a menu item's ingredients
+ * @async
+ * @function updateInventoryForMenuItem
+ * @param {number} menuItemId - ID of the menu item
+ * @param {Object} client - PostgreSQL client for transaction
+ * @throws {Error} If insufficient inventory for any ingredient
+ */
+async function updateInventoryForMenuItem(menuItemId, client) {
+  // Get recipe ingredients for the menu item
+  const recipeQuery = `
+    SELECT inventory_item_id, ingredient_amount
+    FROM Recipe
+    WHERE menu_item_id = $1;
+  `;
+  const recipeResult = await client.query(recipeQuery, [menuItemId]);
+  
+  // Update inventory for each ingredient
+  for (const ingredient of recipeResult.rows) {
+    const updateQuery = `
+      UPDATE Inventory_Item
+      SET quantity = quantity - $1
+      WHERE inventory_item_id = $2
+      RETURNING quantity;
+    `;
+    const updateResult = await client.query(updateQuery, [
+      ingredient.ingredient_amount,
+      ingredient.inventory_item_id
+    ]);
+    
+    // Check if inventory is running low
+    if (updateResult.rows[0].quantity &lt; 0) {
+      throw new Error(`Insufficient inventory for item ${ingredient.inventory_item_id}`);
+    }
+  }
+}
+
+/**
+ * Handles POST requests for creating new orders
+ * @async
+ * @function handler
+ * @param {Object} req - The HTTP request object
+ * @param {Object} res - The HTTP response object
+ * @returns {Promise&lt;void>} JSON response with order confirmation
+ * @throws {Error} Database or inventory errors
+ * 
+ * @description
+ * - Creates a new order with multiple menu items
+ * - Handles special cases for bowls, plates, and bigger plates (menu items 1-3)
+ * - Manages inventory updates for all ordered items
+ * - Uses database transactions to ensure data consistency
+ * - Automatically generates sequential IDs for orders and entries
+ */
+export default async function handler(req, res) {
+  if (req.method === 'POST') {
+    const { employeeId, price, orderEntries } = req.body;
+    const client = await pool.connect();
+    
+    try {
+      // Start a transaction
+      await client.query('BEGIN');
+      
+      // Get the current maximum order ID
+      const maxIdQuery = `
+        SELECT COALESCE(MAX(orders_id), 0) as max_id 
+        FROM Orders;
+      `;
+      const maxIdResult = await client.query(maxIdQuery);
+      const nextOrderId = maxIdResult.rows[0].max_id + 1;
+      
+      // Create the order with the next ID
+      const orderQuery = `
+        INSERT INTO Orders (orders_id, employee_id, price, order_time)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        RETURNING orders_id;
+      `;
+      const orderResult = await client.query(orderQuery, [nextOrderId, employeeId, price]);
+      const orderId = orderResult.rows[0].orders_id;
+      
+      // Get the current maximum order entry ID
+      const maxEntryIdQuery = `
+        SELECT COALESCE(MAX(order_entry_id), 0) as max_entry_id 
+        FROM Order_Entry;
+      `;
+      const maxEntryIdResult = await client.query(maxEntryIdQuery);
+      let nextEntryId = maxEntryIdResult.rows[0].max_entry_id + 1;
+      
+      // Process each order entry
+      for (const entry of orderEntries) {
+        const { menuItemId, id1, id2, id3, side1Id, side2Id, entryPrice } = entry;
+        
+        // Insert the order entry
+        const entryQuery = `
+          INSERT INTO Order_Entry (
+            order_entry_id, order_id, menu_item_id, id1, id2, id3, 
+            side1_id, side2_id, entry_price
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          RETURNING order_entry_id;
+        `;
+        
+        await client.query(entryQuery, [
+          nextEntryId,
+          orderId,
+          menuItemId,
+          id1 || -1,
+          id2 || -1,
+          id3 || -1,
+          side1Id || -1,
+          side2Id || -1,
+          entryPrice
+        ]);
+        
+        // Update inventory based on the type of order
+        if (menuItemId &lt;= 3) {
+          // For Bowl/Plate/Bigger Plate, update inventory for sides and entrees
+          if (side1Id &amp;&amp; side1Id > 0) {
+            await updateInventoryForMenuItem(side1Id, client);
+          }
+          if (id1 &amp;&amp; id1 > 0) {
+            await updateInventoryForMenuItem(id1, client);
+          }
+          if (id2 &amp;&amp; id2 > 0) {
+            await updateInventoryForMenuItem(id2, client);
+          }
+          if (id3 &amp;&amp; id3 > 0) {
+            await updateInventoryForMenuItem(id3, client);
+          }
+        } else {
+          // For individual items (not categories), update inventory directly
+          await updateInventoryForMenuItem(menuItemId, client);
+        }
+        
+        nextEntryId++;
+      }
+      
+      // Commit the transaction
+      await client.query('COMMIT');
+      
+      res.status(200).json({ 
+        success: true, 
+        orderId 
+      });
+      
+    } catch (error) {
+      // Rollback in case of error
+      await client.query('ROLLBACK');
+      console.error('Error processing order:', error);
+      res.status(500).json({ 
+        error: 'Failed to process order',
+        details: error.message 
+      });
+    } finally {
+      client.release();
+    }
+  } else {
+    res.setHeader('Allow', ['POST']);
+    res.status(405).end(`Method ${req.method} Not Allowed`);
+  }
+}</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="Database.html">Database</a></li></ul><h3>Global</h3><ul><li><a href="global.html#generateEmployeeId">generateEmployeeId</a></li><li><a href="global.html#handler">handler</a></li><li><a href="global.html#updateInventoryForMenuItem">updateInventoryForMenuItem</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.4</a> on Wed Dec 04 2024 18:08:19 GMT-0600 (Central Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
